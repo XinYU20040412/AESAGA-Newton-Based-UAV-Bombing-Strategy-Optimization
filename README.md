@@ -1,2 +1,3 @@
-# HNU_sanjin
-all of the projects is what i have done when i was a undergraduate in HNU 
+# 2025全国大学生数学建模竞赛
+本人承担独立建模手与编程手
+
