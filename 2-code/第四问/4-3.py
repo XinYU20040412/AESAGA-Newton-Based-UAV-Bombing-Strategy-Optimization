@@ -1,0 +1,685 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Callable
+import logging
+from cover_checker import AdvancedMissileSmokeChecker
+from system_at_t import cover_system
+from fitness import init_theta  # 导入fitness.py中的函数
+
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class AESAGAWithNewton:
+    """结合AE-SAGA全局搜索与牛顿法局部搜索的混合优化算法"""
+
+    def __init__(self,
+                 pop_size: int = 50,
+                 elite_size: float = 0.1,
+                 Pc1: float = 0.95,
+                 Pc2: float = 0.4,
+                 Pm1: float = 0.3,
+                 Pm2: float = 0.001,
+                 T0: float = None,
+                 T_final: float = 0.001,
+                 alpha: float = 0.97,
+                 beta: float = 1.0,
+                 max_stagnation: int = 8,
+                 newton_max_iter: int = 30,
+                 newton_tol: float = 1e-5,
+                 restart_threshold: float = 0.01,
+                 diversity_threshold: float = 0.1,
+                 # 核心参数：与fitness函数相关的物理参数
+                 min_theta: float = 25,
+                 dleta_tdrop: float = 40,
+                 dleta_texpl_diff: float = 20):
+        """初始化算法参数"""
+        self.pop_size = pop_size
+        self.elite_size = int(pop_size * elite_size)
+        self.Pc1 = Pc1
+        self.Pc2 = Pc2
+        self.Pm1 = Pm1
+        self.Pm2 = Pm2
+        self.T0 = T0
+        self.T_final = T_final
+        self.alpha = alpha
+        self.beta = beta
+        self.max_stagnation = max_stagnation
+        self.restart_threshold = restart_threshold
+        self.diversity_threshold = diversity_threshold
+
+        # 牛顿法参数
+        self.newton_max_iter = newton_max_iter
+        self.newton_tol = newton_tol
+        self.epsilon = 1e-6  # 数值微分步长
+
+        # 新增参数
+        self.restart_count = 0
+        self.max_restarts = 5
+        self.line_search_alpha = 0.5
+        self.line_search_beta = 0.8
+
+        # 创建烟雾检查器实例
+        self.checker = AdvancedMissileSmokeChecker()
+
+        # 初始化基础角度
+        self.cover_plan = [0, 1, 2, 0, 1]  # 5个发射点对应3枚导弹
+        self.theta_base = init_theta(self.cover_plan)  # 初始化基础角度
+
+        # 核心参数：与fitness函数保持一致
+        self.min_theta = min_theta                  # 角度调整范围（±min_theta度）
+        self.dleta_tdrop = dleta_tdrop              # 释放时间最大值
+        self.dleta_texpl_diff = dleta_texpl_diff    # 起爆时间差最大值
+
+    def load_best_parameters(self, file_path: str = 'aesaga_newton_best_result.txt') -> np.ndarray:
+        """读取上次保存的最优参数（修复解析逻辑）"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+            
+            if not lines:
+                logger.warning("最优参数文件为空，将使用随机初始化")
+                return None
+
+            params = []
+            # 解析3枚导弹的参数（每枚4个核心参数）
+            for i in range(3):
+                missile_line = f"导弹 {i+1}:"
+                # 查找当前导弹参数的起始行
+                line_indices = [idx for idx, line in enumerate(lines) if missile_line in line]
+                if not line_indices:
+                    raise ValueError(f"未找到导弹 {i+1} 的参数行")
+                start_idx = line_indices[0]
+
+                # 解析参数（跳过"起爆时间"字段，因为它是派生值）
+                param_map = {
+                    "速度:": 0,
+                    "角度:": 1,
+                    "释放时间:": 2,
+                    "起爆时间差:": 3
+                }
+                missile_params = [None] * 4  # 存储4个核心参数
+
+                # 从起始行后开始查找参数
+                for j in range(start_idx + 1, len(lines)):
+                    line = lines[j]
+                    # 遇到下一枚导弹的标记则停止
+                    if f"导弹 {i+2}:" in line:
+                        break
+                    # 解析当前行的参数
+                    for key, idx in param_map.items():
+                        if key in line and missile_params[idx] is None:
+                            try:
+                                value = float(line.split(':')[1].strip().split()[0])
+                                missile_params[idx] = value
+                            except (IndexError, ValueError):
+                                raise ValueError(f"导弹 {i+1} 的{key}参数格式错误: {line}")
+
+                # 检查是否收集到所有必要参数
+                if None in missile_params:
+                    missing = [k for k, idx in param_map.items() if missile_params[idx] is None]
+                    raise ValueError(f"导弹 {i+1} 缺少参数: {missing}")
+
+                # 转换为比例参数
+                vi, theta_deg, tdrop, texpl_diff = missile_params
+
+                # 速度比例: (vi-70)/70
+                vi_ratio = (vi - 70) / 70
+
+                # 角度比例: (角度 - 基础角度 + min_theta)/(2*min_theta)
+                theta_base_deg = self.theta_base[i] * 180 / np.pi
+                theta_ratio = (theta_deg - theta_base_deg + self.min_theta) / (2 * self.min_theta)
+
+                # 释放时间比例: tdrop/dleta_tdrop
+                tdrop_ratio = tdrop / self.dleta_tdrop
+
+                # 起爆时间差比例: texpl_diff/dleta_texpl_diff
+                texpl_diff_ratio = texpl_diff / self.dleta_texpl_diff
+
+                params.extend([vi_ratio, theta_ratio, tdrop_ratio, texpl_diff_ratio])
+            
+            # 裁剪到[0,1]范围
+            result = np.clip(np.array(params), 0, 1)
+            logger.info(f"成功读取上次最优参数，形状: {result.shape}")
+            return result
+        
+        except FileNotFoundError:
+            logger.warning(f"未找到最优参数文件: {file_path}，将使用随机初始化")
+            return None
+        except (IndexError, ValueError) as e:
+            logger.warning(f"读取上次最优参数失败：{e}，将使用随机初始化")
+            return None
+
+    def fitness(self, x: np.ndarray) -> float:
+        """计算个体适应度（阻断时间）"""
+        x = x.reshape(3, 4)
+        vi, theta, tdrop, texpl = [], [], [], []
+
+        for i in range(3):
+            # 速度: 70-140 m/s
+            vi.append(70 + x[i, 0] * 70)
+
+            # 角度: 基础角度 ±min_theta度（转换为弧度）
+            angle_adjustment = (x[i, 1] * 2 * self.min_theta - self.min_theta) * np.pi / 180
+            theta.append(self.theta_base[i] + angle_adjustment)
+
+            # 释放时间: 0-dleta_tdrop秒
+            tdrop.append([x[i, 2] * self.dleta_tdrop])
+
+            # 起爆时间: 释放时间 + 时间差
+            texpl.append([x[i, 3] * self.dleta_texpl_diff + x[i, 2] * self.dleta_tdrop])
+
+        vi, theta, tdrop, texpl = np.array(vi), np.array(theta), np.array(tdrop), np.array(texpl)
+        cover = cover_system(vi, theta, tdrop, texpl)
+
+        # 计算阻断时间
+        pace = 100
+        t_block = 0
+        delta_t = 67 / pace
+        for t in np.linspace(0, 67, pace):
+            Mj, smokes_location = cover(t, 1)
+            if len(smokes_location) > 0 and self.checker.check(Mj, smokes_location):
+                t_block += delta_t
+
+        return t_block
+
+    def _negative_fitness(self, x: np.ndarray) -> float:
+        """用于牛顿法的负适应度函数"""
+        return -self.fitness(x)
+
+    def _gradient(self, x: np.ndarray) -> np.ndarray:
+        """数值计算梯度"""
+        grad = np.zeros_like(x)
+        for i in range(len(x)):
+            x_plus = x.copy()
+            x_plus[i] += self.epsilon
+            x_minus = x.copy()
+            x_minus[i] -= self.epsilon
+            grad[i] = (self._negative_fitness(x_plus) - self._negative_fitness(x_minus)) / (2 * self.epsilon)
+        return grad
+
+    def _hessian(self, x: np.ndarray) -> np.ndarray:
+        """数值计算海森矩阵"""
+        n = len(x)
+        hess = np.zeros((n, n))
+        for i in range(n):
+            x_plus = x.copy()
+            x_plus[i] += self.epsilon
+            x_minus = x.copy()
+            x_minus[i] -= self.epsilon
+            grad_plus = self._gradient(x_plus)
+            grad_minus = self._gradient(x_minus)
+            hess[i] = (grad_plus - grad_minus) / (2 * self.epsilon)
+
+        # 增加正则化，提高稳定性
+        min_eig = np.min(np.real(np.linalg.eigvals(hess)))
+        if min_eig < 1e-6:
+            hess += (1e-6 - min_eig) * np.eye(n)
+        return hess
+
+    def _line_search(self, x: np.ndarray, direction: np.ndarray, grad: np.ndarray) -> float:
+        """线搜索寻找最佳步长"""
+        alpha = 1.0
+        f_x = self._negative_fitness(x)
+        x_new = x + alpha * direction
+
+        # 确保在搜索空间内
+        if np.any(x_new < 0) or np.any(x_new > 1):
+            alpha = 0.1
+
+        # Armijo条件
+        while self._negative_fitness(x_new) > f_x + self.line_search_alpha * alpha * np.dot(grad, direction):
+            alpha *= self.line_search_beta
+            x_new = x + alpha * direction
+            if alpha < 1e-8:
+                return 1e-8
+        return alpha
+
+    def newton_optimize(self, x0: np.ndarray) -> np.ndarray:
+        """牛顿法局部优化"""
+        x = x0.copy()
+        for i in range(self.newton_max_iter):
+            grad = self._gradient(x)
+            if np.linalg.norm(grad) < self.newton_tol:
+                logger.info(f"牛顿法在第{i + 1}次迭代收敛")
+                break
+
+            hess = self._hessian(x)
+            try:
+                direction = -np.linalg.solve(hess, grad)
+                alpha = self._line_search(x, direction, grad)
+                x_new = x + alpha * direction
+                x_new = np.clip(x_new, 0, 1)
+
+                if self._negative_fitness(x_new) < self._negative_fitness(x):
+                    x = x_new
+                else:
+                    # 尝试更小的步长
+                    for _ in range(3):
+                        alpha *= 0.5
+                        x_new = x + alpha * direction
+                        x_new = np.clip(x_new, 0, 1)
+                        if self._negative_fitness(x_new) < self._negative_fitness(x):
+                            x = x_new
+                            break
+                    else:
+                        logger.info(f"牛顿法在第{i + 1}次迭代未找到更优点")
+                        break
+            except np.linalg.LinAlgError:
+                logger.warning("海森矩阵求解失败，使用梯度下降代替")
+                x_new = x - 0.01 * grad
+                x_new = np.clip(x_new, 0, 1)
+                x = x_new
+
+        return x
+
+    def adaptive_Pc(self, f_prime: float, f_avg: float, f_max: float) -> float:
+        """自适应交叉概率"""
+        if f_max == f_avg:
+            return self.Pc1
+        diversity = self.population_diversity()
+        diversity_factor = 1.0 + (self.diversity_threshold - min(diversity, self.diversity_threshold)) / self.diversity_threshold
+        if f_prime >= f_avg:
+            return diversity_factor * (self.Pc1 - (self.Pc1 - self.Pc2) * (f_prime - f_avg) / (f_max - f_avg))
+        else:
+            return diversity_factor * self.Pc1
+
+    def adaptive_Pm(self, f: float, f_avg: float, f_max: float) -> float:
+        """自适应变异概率"""
+        if f_max == f_avg:
+            return self.Pm1
+        diversity = self.population_diversity()
+        diversity_factor = 1.0 + (self.diversity_threshold - min(diversity, self.diversity_threshold)) / self.diversity_threshold
+        if f >= f_avg:
+            return diversity_factor * (self.Pm1 - (self.Pm1 - self.Pm2) * (f_max - f) / (f_max - f_avg))
+        else:
+            return diversity_factor * self.Pm1
+
+    def population_diversity(self) -> float:
+        """计算种群多样性"""
+        if not hasattr(self, 'population'):
+            return 1.0
+        distances = []
+        for i in range(len(self.population)):
+            for j in range(i + 1, len(self.population)):
+                distances.append(np.linalg.norm(self.population[i] - self.population[j]))
+        return np.mean(distances) if distances else 1.0
+
+    def initialize_population(self) -> np.ndarray:
+        """初始化种群"""
+        n_dim = 12  # 3枚导弹 × 4个参数
+        pop = np.zeros((self.pop_size, n_dim))
+        
+        # 尝试读取上次最优参数
+        best_prev = self.load_best_parameters()
+        
+        if best_prev is not None:
+            # 用上次最优参数生成部分个体
+            num_based = int(self.pop_size * 0.5)
+            for i in range(num_based):
+                pop[i] = best_prev + np.random.normal(0, 0.05, n_dim)
+                pop[i] = np.clip(pop[i], 0, 1)
+            
+            # 剩余个体用均匀分布生成
+            for i in range(num_based, self.pop_size):
+                pop[i] = np.random.uniform(0, 1, n_dim)
+        else:
+            pop = np.random.uniform(0, 1, (self.pop_size, n_dim))
+        
+        return np.clip(pop, 0, 1)
+
+    def selection(self, population: np.ndarray, fitness_values: np.ndarray) -> np.ndarray:
+        """选择算子"""
+        sorted_indices = np.argsort(fitness_values)[::-1]
+        top_indices = sorted_indices[:int(0.3 * len(population))]
+
+        remaining_indices = sorted_indices[int(0.3 * len(population)):]
+        min_fitness = np.min(fitness_values[remaining_indices])
+        adjusted_fitness = fitness_values[remaining_indices] - min_fitness + 1e-6 if min_fitness < 0 else fitness_values[remaining_indices]
+        fitness_sum = np.sum(adjusted_fitness)
+        selection_probs = adjusted_fitness / fitness_sum if fitness_sum != 0 else np.ones(len(adjusted_fitness)) / len(adjusted_fitness)
+
+        # 锦标赛选择
+        tournament_size = 3
+        tournament_selected = []
+        for _ in range(self.elite_size):
+            candidates = np.random.choice(top_indices, tournament_size)
+            tournament_selected.append(candidates[np.argmax(fitness_values[candidates])])
+
+        # 轮盘赌选择
+        roulette_selected = np.random.choice(remaining_indices,
+                                             size=len(population) - self.elite_size - len(tournament_selected),
+                                             p=selection_probs,
+                                             replace=True)
+
+        return np.concatenate([tournament_selected, roulette_selected])
+
+    def crossover(self, parent1: np.ndarray, parent2: np.ndarray, Pc: float) -> Tuple[np.ndarray, np.ndarray]:
+        """交叉算子"""
+        if np.random.random() > Pc:
+            return parent1.copy(), parent2.copy()
+
+        # 根据父母相似度选择交叉方式
+        similarity = 1 - np.linalg.norm(parent1 - parent2) / np.sqrt(len(parent1))
+        if similarity > 0.7:
+            mask = np.random.random(len(parent1)) < 0.5
+            child1 = np.where(mask, parent1, parent2)
+            child2 = np.where(mask, parent2, parent1)
+        else:
+            crossover_point = np.random.randint(1, len(parent1))
+            child1 = np.concatenate([parent1[:crossover_point], parent2[crossover_point:]])
+            child2 = np.concatenate([parent2[:crossover_point], parent1[crossover_point:]])
+
+        return child1, child2
+
+    def mutation(self, individual: np.ndarray, Pm: float) -> np.ndarray:
+        """变异算子"""
+        mutated = individual.copy()
+        n = len(mutated)
+
+        for i in range(n):
+            if np.random.random() < Pm:
+                if np.random.random() < 0.5:
+                    # 高斯变异
+                    sigma = 0.1 * (1 + (self.diversity_threshold - min(self.population_diversity(),
+                                                                       self.diversity_threshold)) / self.diversity_threshold)
+                    mutated[i] += np.random.normal(0, sigma)
+                else:
+                    # 均匀变异
+                    mutated[i] = np.random.random()
+
+        return np.clip(mutated, 0, 1)
+
+    def boltzmann_acceptance(self, delta_f: float, T: float) -> bool:
+        """Boltzmann接受准则"""
+        if delta_f > 0:
+            return True
+        acceptance_prob = np.exp(delta_f / (T + 1e-8))
+        return np.random.random() < acceptance_prob
+
+    def restart_population(self, best_individual: np.ndarray) -> np.ndarray:
+        """种群重启策略"""
+        self.restart_count += 1
+        logger.info(f"种群重启，第{self.restart_count}次重启")
+        new_pop = np.zeros((self.pop_size, len(best_individual)))
+        new_pop[0] = best_individual.copy()
+        # 围绕最优个体生成相似个体
+        for i in range(1, int(self.pop_size * 0.3)):
+            new_pop[i] = best_individual + np.random.normal(0, 0.1, len(best_individual))
+        # 生成全新个体
+        for i in range(int(self.pop_size * 0.3), self.pop_size):
+            new_pop[i] = np.random.random(len(best_individual))
+        return np.clip(new_pop, 0, 1)
+
+    def optimize(self, generations: int = 150) -> Tuple[np.ndarray, float, List[float], List[float]]:
+        """执行优化"""
+        population = self.initialize_population()
+        fitness_values = np.array([self.fitness(ind) for ind in population])
+        self.population = population
+
+        if self.T0 is None:
+            self.T0 = (np.max(fitness_values) - np.min(fitness_values)) * 5
+
+        T = self.T0
+        best_fitness_history = []
+        avg_fitness_history = []
+        stagnation_count = 0
+        prev_best_fitness = -np.inf
+        global_best_fitness = -np.inf
+        global_best_individual = None
+
+        for generation in range(generations):
+            best_idx = np.argmax(fitness_values)
+            best_fitness = fitness_values[best_idx]
+            best_individual = population[best_idx].copy()
+            avg_fitness = np.mean(fitness_values)
+
+            if best_fitness > global_best_fitness:
+                global_best_fitness = best_fitness
+                global_best_individual = best_individual.copy()
+
+            best_fitness_history.append(best_fitness)
+            avg_fitness_history.append(avg_fitness)
+
+            # 检查停滞
+            if best_fitness <= prev_best_fitness + self.restart_threshold:
+                stagnation_count += 1
+            else:
+                stagnation_count = 0
+                prev_best_fitness = best_fitness
+
+            # 自适应调整参数
+            diversity = self.population_diversity()
+            if generation > 5:
+                if diversity < self.diversity_threshold * 0.5:
+                    self.beta = min(1.2, self.beta * 1.05)
+                elif diversity > self.diversity_threshold * 1.5:
+                    self.beta = max(0.8, self.beta * 0.95)
+
+            logger.info(f"第{generation + 1}代 - 最佳适应度: {best_fitness:.6f}, 平均适应度: {avg_fitness:.6f}, "
+                        f"温度: {T:.6f}, 多样性: {diversity:.6f}, 停滞计数: {stagnation_count}")
+
+            # 终止条件
+            if T < self.T_final:
+                logger.info(f"温度低于阈值，AE-SAGA终止于第{generation + 1}代")
+                break
+
+            # 种群重启
+            if stagnation_count >= self.max_stagnation and self.restart_count < self.max_restarts:
+                population = self.restart_population(best_individual)
+                fitness_values = np.array([self.fitness(ind) for ind in population])
+                stagnation_count = 0
+                T = self.T0 * (0.7 ** self.restart_count)
+                self.population = population
+                logger.info(f"种群重启后温度: {T:.6f}")
+                continue
+
+            # 构建新种群
+            elite_indices = np.argsort(fitness_values)[-self.elite_size:]
+            new_population = population[elite_indices].tolist()
+
+            # 选择操作
+            selected_indices = self.selection(population, fitness_values)
+
+            # 交叉和变异
+            for i in range(0, len(selected_indices), 2):
+                if i + 1 >= len(selected_indices):
+                    idx = selected_indices[i]
+                    new_population.append(population[idx].copy())
+                    break
+
+                idx1, idx2 = selected_indices[i], selected_indices[i + 1]
+                parent1, parent2 = population[idx1], population[idx2]
+                f1, f2 = fitness_values[idx1], fitness_values[idx2]
+
+                # 自适应交叉
+                Pc = self.adaptive_Pc(max(f1, f2), avg_fitness, best_fitness)
+                child1, child2 = self.crossover(parent1, parent2, Pc)
+
+                # 自适应变异
+                Pm1 = self.adaptive_Pm(f1, avg_fitness, best_fitness)
+                Pm2 = self.adaptive_Pm(f2, avg_fitness, best_fitness)
+                child1 = self.mutation(child1, Pm1)
+                child2 = self.mutation(child2, Pm2)
+
+                # 评估子代
+                f_child1 = self.fitness(child1)
+                f_child2 = self.fitness(child2)
+
+                # Boltzmann接受
+                if self.boltzmann_acceptance(f_child1 - f1, T):
+                    new_population.append(child1)
+                else:
+                    new_population.append(parent1)
+
+                if self.boltzmann_acceptance(f_child2 - f2, T):
+                    new_population.append(child2)
+                else:
+                    new_population.append(parent2)
+
+            # 保持种群大小
+            if len(new_population) > self.pop_size:
+                new_population = new_population[:self.pop_size]
+            elif len(new_population) < self.pop_size:
+                while len(new_population) < self.pop_size:
+                    new_population.append(np.random.random(12))
+
+            # 偶尔引入随机个体
+            if np.random.random() < 0.08:
+                random_idx = np.random.randint(0, self.pop_size)
+                new_population[random_idx] = np.random.random(12)
+
+            population = np.array(new_population)
+            self.population = population
+            fitness_values = np.array([self.fitness(ind) for ind in population])
+
+            # 温度衰减
+            T *= self.alpha * self.beta
+
+        # 多起点牛顿法局部搜索
+        logger.info("开始多起点牛顿法局部优化...")
+        sorted_indices = np.argsort(fitness_values)[::-1]
+        candidates = population[sorted_indices[:min(5, self.pop_size // 2)]]
+        candidates = np.append(candidates, [global_best_individual], axis=0)
+
+        best_refined_fitness = -np.inf
+        best_refined_individual = None
+
+        for i, candidate in enumerate(candidates):
+            logger.info(f"对第{i + 1}个候选解进行牛顿法优化")
+            refined = self.newton_optimize(candidate)
+            refined_fitness = self.fitness(refined)
+
+            if refined_fitness > best_refined_fitness:
+                best_refined_fitness = refined_fitness
+                best_refined_individual = refined
+
+        # 比较优化结果
+        if best_refined_fitness > global_best_fitness:
+            best_fitness_history.append(best_refined_fitness)
+            avg_fitness_history.append(avg_fitness_history[-1])
+            logger.info(f"牛顿法优化成功，适应度从{global_best_fitness:.6f}提升至{best_refined_fitness:.6f}")
+            best_individual = best_refined_individual
+            best_fitness = best_refined_fitness
+        else:
+            logger.info("牛顿法未找到更优解，保留全局搜索结果")
+            best_individual = global_best_individual
+            best_fitness = global_best_fitness
+
+        return best_individual, best_fitness, best_fitness_history, avg_fitness_history
+
+    def plot_results(self, best_fitness_history: List[float], avg_fitness_history: List[float]):
+        """绘制优化结果"""
+        plt.figure(figsize=(12, 8))
+
+        plt.subplot(2, 2, 1)
+        plt.plot(range(1, len(best_fitness_history) + 1), best_fitness_history, 'r-', label='最佳适应度')
+        plt.plot(range(1, len(avg_fitness_history) + 1), avg_fitness_history, 'b--', label='平均适应度')
+        plt.xlabel('代数')
+        plt.ylabel('适应度值 (阻断时间/秒)')
+        plt.title('AE-SAGA+牛顿法优化过程 - 适应度变化')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(2, 2, 2)
+        diff = np.array(best_fitness_history) - np.array(avg_fitness_history)
+        plt.plot(range(1, len(diff) + 1), diff, 'g-', label='最佳与平均适应度差值')
+        plt.xlabel('代数')
+        plt.ylabel('适应度差值')
+        plt.title('最佳与平均适应度差值变化')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(2, 2, 3)
+        if hasattr(self, 'population'):
+            diversity_history = [self.population_diversity()]  # 实际使用时需在迭代中记录
+            plt.plot(range(1, len(diversity_history) + 1), diversity_history, 'm-', label='种群多样性')
+            plt.xlabel('代数')
+            plt.ylabel('多样性')
+            plt.title('种群多样性变化')
+            plt.legend()
+            plt.grid(True)
+
+        plt.tight_layout()
+        plt.savefig('aesaga_newton_optimization.png', dpi=300)
+        plt.close()
+
+
+# 运行优化算法
+if __name__ == "__main__":
+    try:
+        plt.rcParams['font.sans-serif'] = ['SimHei']
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        print("警告: 无法设置中文字体，图表中的中文可能无法正确显示")
+
+    # 初始化优化器
+    optimizer = AESAGAWithNewton(
+        pop_size=60,
+        elite_size=0.15,
+        Pc1=0.95,
+        Pc2=0.4,
+        Pm1=0.3,
+        Pm2=0.001,
+        T0=200.0,
+        T_final=0.01,
+        alpha=0.97,
+        beta=1.0,
+        max_stagnation=6,
+        newton_max_iter=30,
+        newton_tol=1e-5,
+        restart_threshold=0.01,
+        diversity_threshold=0.1,
+        min_theta=25,
+        dleta_tdrop=15,
+        dleta_texpl_diff=15
+    )
+
+    best_individual, best_fitness, best_history, avg_history = optimizer.optimize(generations=200)
+
+    optimizer.plot_results(best_history, avg_history)
+
+    # 转换为实际参数
+    best_individual = best_individual.reshape(3, 4)
+    best_params = []
+
+    for i in range(3):
+        vi = 70 + best_individual[i, 0] * 70
+        theta_deg = (best_individual[i, 1] * 2 * optimizer.min_theta - optimizer.min_theta) + \
+                    optimizer.theta_base[i] * 180 / np.pi
+        tdrop = best_individual[i, 2] * optimizer.dleta_tdrop
+        texpl_diff = best_individual[i, 3] * optimizer.dleta_texpl_diff
+        texpl = tdrop + texpl_diff
+
+        best_params.append({
+            '速度': vi,
+            '角度': theta_deg,
+            '释放时间': tdrop,
+            '起爆时间差': texpl_diff,
+            '起爆时间': texpl
+        })
+
+    print("\n最佳参数:")
+    for i, params in enumerate(best_params):
+        print(f"导弹 {i + 1}:")
+        print(f"  速度: {params['速度']:.2f} m/s")
+        print(f"  角度: {params['角度']:.2f}°")
+        print(f"  释放时间: {params['释放时间']:.2f} s")
+        print(f"  起爆时间差: {params['起爆时间差']:.2f} s")
+        print(f"  起爆时间: {params['起爆时间']:.2f} s")
+
+    print(f"\n阻断时间: {best_fitness:.6f} s")
+
+    # 保存最优结果（保持格式一致性）
+    with open('aesaga_newton_best_result.txt', 'w', encoding='utf-8') as f:
+        f.write(f"最佳适应度(阻断时间): {best_fitness:.6f} s\n")
+        for i, params in enumerate(best_params):
+            f.write(f"导弹 {i + 1}:\n")
+            f.write(f"  速度: {params['速度']:.2f} m/s\n")
+            f.write(f"  角度: {params['角度']:.2f}°\n")
+            f.write(f"  释放时间: {params['释放时间']:.2f} s\n")
+            f.write(f"  起爆时间差: {params['起爆时间差']:.2f} s\n")
+            f.write(f"  起爆时间: {params['起爆时间']:.2f} s\n")
+
+    print("\n优化完成！结果已保存到 'aesaga_newton_best_result.txt'")
+    print("优化过程图表已保存到 'aesaga_newton_optimization.png'")

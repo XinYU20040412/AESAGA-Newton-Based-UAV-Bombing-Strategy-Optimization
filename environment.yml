@@ -1,0 +1,19 @@
+name: hnu_aesaga
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - seaborn
+  - openpyxl
+  - xlrd
+  - xlsxwriter
+  - pip:
+    - tqdm
+    - tabulate
+    - scikit-learn
+    - xlrd
