@@ -1,0 +1,23 @@
+{
+  "best_parameters": {
+    "speed_mps": 71.23814667292801,
+    "theta_deg": 176.0547057261043,
+    "tdrop_s": 0.05697767416776521,
+    "texpl_s": 2.4687595819257226,
+    "texpl_delay_s": 2.4117819077579576
+  },
+  "cover_result": {
+    "effective_cover_s": 4.307142857142857,
+    "cover_intervals_s": [
+      [
+        2.7119047619047616,
+        7.019047619047619
+      ]
+    ]
+  },
+  "visual_assets": {
+    "hero_png": "full_process_3d.png",
+    "hero_gif": "full_process_3d.gif",
+    "timeline_png": "full_process_timeline.png"
+  }
+}

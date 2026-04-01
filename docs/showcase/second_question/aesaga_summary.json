@@ -1,0 +1,23 @@
+{
+  "best_fitness": 4.307142857142857,
+  "best_parameters": {
+    "speed_mps": 71.23814667292801,
+    "theta_deg": 176.0547057261043,
+    "tdrop_s": 0.05697767416776521,
+    "texpl_delay_s": 2.4117819077579576,
+    "texpl_s": 2.4687595819257226
+  },
+  "history": {
+    "generations": 27,
+    "best_max": 4.307142857142857,
+    "best_mean": 3.4858906525573183,
+    "avg_final": 3.936819727891155
+  },
+  "output_files": {
+    "curve_png": "aesaga_optimization.png",
+    "workflow_png": "aesaga_workflow.png",
+    "metrics_csv": "aesaga_metrics.csv",
+    "result_txt": "aesaga_best_result.txt",
+    "gif": "aesaga_optimization.gif"
+  }
+}
